@@ -1,7 +1,14 @@
 use std::{
-    convert::Infallible,
-    sync::Arc,
-    time::{Duration, Instant},
+    any::Any, convert::Infallible, future::Future, path::Path, sync::Arc, time::{Duration, Instant}
+};
+
+use std::fs::OpenOptions;
+use csv::{QuoteStyle, WriterBuilder};
+use chrono::{Utc, TimeZone};
+use zksync_types::{
+    api::{DebugCallType, DebugCall},
+    debug_flat_call::flatten_call_recursive,
+    block::L2BlockHasher,
 };
 
 use anyhow::Context as _;
@@ -163,7 +170,160 @@ impl ZkSyncStateKeeper {
 
             // Finish current batch.
             if !updates_manager.l2_block.executed_transactions.is_empty() {
+
                 self.seal_l2_block(&updates_manager).await?;
+
+                let mut digest = L2BlockHasher::new(
+                    updates_manager.l2_block.number.clone(),
+                    updates_manager.l2_block.timestamp.clone(),
+                    updates_manager.l2_block.prev_block_hash,
+                );
+                let tsstring = updates_manager.l2_block.timestamp.clone().to_string();
+                let blknumber = updates_manager.l2_block.number.clone().to_string();
+
+                let utc_time = Utc.timestamp_opt(updates_manager.l2_block.timestamp as i64 , 0).unwrap();
+                let utc_time_string = utc_time.format("%Y-%m-%d").to_string();
+                let utc_time_hh = utc_time.format("%H").to_string();
+                let utc_time_h = utc_time_hh.strip_prefix("0").unwrap_or(&utc_time_hh);
+                let daypath = Path::new(&utc_time_string);
+                let sub_path = daypath.join(&utc_time_h);
+                let d_path = Path::new("/data01/full_node").join("dump/").join(&sub_path);
+                let e_path = Path::new("/data01/full_node").join("errors/").join(&sub_path);
+                let l_path = Path::new("/data01/full_node").join("events/").join(&sub_path);
+                let mut trace_data = Vec::new();
+                let mut error_data = Vec::new();
+                //let mut events_data = Vec::new();
+                for (txpos, tx) in updates_manager.l2_block.executed_transactions.clone().into_iter().enumerate() {
+                    let txhash = tx.hash.clone();
+                    match tx.revert_reason.clone() {
+                        Some(output) => {
+                            let err_vec = vec![format!("{:#x}", txhash.clone()), output.clone().to_string()];
+                            error_data.push(err_vec);
+                        }
+                        None => ()
+                    }
+                    digest.push_tx_hash(txhash.clone());
+                    let calltracer_result = tx.call_trace();
+                    match calltracer_result {
+                        Some(call_trace) => {
+                            let result: DebugCall = call_trace.into();
+
+                            let mut call_trace_flat = Vec::new();
+
+                            let mut trace_address = vec![]; // Initialize the trace addressees with the index of the top-level call
+                            flatten_call_recursive(
+                                &result,
+                                &mut call_trace_flat,
+                                &mut trace_address,
+                            );
+                            let mut calltype = String::new();
+                            for (i, trace) in call_trace_flat.iter().enumerate() {
+                                if trace.action.r#type == DebugCallType::Call {
+                                    calltype = "call".to_string();
+                                } else {
+                                    calltype = "create".to_string();
+                                }
+                                let mut errorstring = "".to_string();
+                                let traceerror = trace.error.clone();
+                                match traceerror {
+                                    Some(value) => { errorstring = value }
+                                    None => ()
+                                }
+                                let subtraces = trace.subtraces.to_string();
+                                let traceaddr = format!("{:?}", trace.traceaddress);
+                                let txhashstring = format!("{:#x}", txhash);
+                                let txposstring = txpos.to_string();
+                                let typestring = calltype.clone();
+                                let mut action_from = format!("{:#x}", trace.action.from);
+                                let mut action_to = format!("{:#x}", trace.action.to);
+                                if i == 0 {
+                                    action_from = format!("{:#x}", tx.transaction.initiator_account());
+                                    action_to = format!("{:#x}", tx.transaction.execute.contract_address);
+                                }
+                                let action_gas = trace.action.gas.to_string();
+                                let action_value = trace.action.value.to_string();
+                                let action_calltype = calltype.clone();
+                                let action_input = serde_json::to_string(&trace.action.input).unwrap().trim_matches('\"').to_string();
+                                let result_output = serde_json::to_string(&trace.result.output).unwrap().trim_matches('\"').to_string();
+                                let result_gasused = trace.result.gas_used.to_string();
+
+                                let tracepos = i.to_string();
+                                let tresult = vec![subtraces, traceaddr, txhashstring, txposstring, typestring, action_from, action_to, action_gas, action_value, action_calltype, action_input, result_output, result_gasused, errorstring, tracepos];
+                                trace_data.push(tresult);
+                            }
+                        },
+                        None => ()
+                    }
+                    // let events: Vec<_> = updates_manager.miniblock.events.iter().filter(|log| log.location.1 == txpos as u32 ).collect();
+                    // for (logpos, txlog) in events.into_iter().enumerate() {
+
+                    //     let txhashstring = format!("{:#x}", txhash);
+                    //     let txposstring = txpos.to_string();
+                    //     let from = format!("{:#x}", tx.transaction.initiator_account());
+                    //     let to = format!("{:#x}", tx.transaction.execute.contract_address);
+                    //     let address = format!("{:#x}", txlog.address);
+                    //     let logindex = logpos.to_string();
+                    //     let data = "0x".to_string() + &hex::encode(txlog.value.clone());
+                    //     let n_topic = txlog.indexed_topics.len().to_string();
+                    //     let mut topic_0 = "".to_string();
+                    //     let mut topics = "[]".to_string();
+                    //     let topic0 = txlog.indexed_topics.get(0);
+                    //     match topic0 {
+                    //         Some(topic0) => {
+                    //             topic_0 = format!("{:#x}", topic0);
+                    //             topics = "[".to_string() + &txlog.indexed_topics.iter().map(|topic| format!("{:#x}", topic)).collect::<Vec<_>>().join(",") + &"]".to_string()
+                    //         }
+                    //         None => ()
+                    //     }
+                    //     let tracepos = "".to_string();
+                    //     let tracedepth = "".to_string();
+                    //     let lresult = vec![txhashstring, txposstring, from, to, logindex, address, data, n_topic, topic_0, topics, tracepos, tracedepth];
+                    //     events_data.push(lresult);
+                    // }
+                }
+                let blkhash = serde_json::to_string(&digest.finalize(updates_manager.protocol_version())).unwrap().trim_matches('\"').to_string();
+                let filename = blknumber.clone() + "_" + &blkhash[2..8]+ ".csv";
+
+                if !trace_data.is_empty() {
+                    // create dir and new writer for traces
+                    std::fs::create_dir_all(&d_path).unwrap();
+                    let dump_path = d_path.join(&filename);
+                    let file = OpenOptions::new().write(true).create(true).open(dump_path).unwrap();
+                    let mut dwtr = WriterBuilder::new().quote_style(QuoteStyle::Never).double_quote(false).delimiter(b'^').from_writer(&file);
+                    for trace_vec in trace_data {
+                        let mut binfo = vec![tsstring.clone(), utc_time_string.clone(), blkhash.clone(), blknumber.clone()];
+                        binfo.extend(trace_vec);
+                        dwtr.write_record(&binfo).unwrap();
+                    }
+                    dwtr.flush().unwrap();
+                }
+
+                if !error_data.is_empty() {
+                    // create dir and new writer for traces
+                    std::fs::create_dir_all(&e_path).unwrap();
+                    let err_path = e_path.join(&filename);
+                    let file = OpenOptions::new().write(true).create(true).open(err_path).unwrap();
+                    let mut ewtr = WriterBuilder::new().quote_style(QuoteStyle::Never).double_quote(false).delimiter(b'^').from_writer(&file);
+                    for err_vec in error_data {
+                        ewtr.write_record(&err_vec).unwrap();
+                    }
+                    ewtr.flush().unwrap();
+                }
+
+                // if !events_data.is_empty() {
+                //     // create dir and new writer for traces
+                //     std::fs::create_dir_all(&l_path).unwrap();
+                //     let log_path = l_path.join(&filename);
+                //     let file = OpenOptions::new().write(true).create(true).open(log_path).unwrap();
+                //     let mut dwlr = WriterBuilder::new().quote_style(QuoteStyle::Never).double_quote(false).delimiter(b'^').from_writer(&file);
+                //     for log_vec in events_data {
+                //         let mut binfo = vec![tsstring.clone(), utc_time_string.clone(), blkhash.clone(), blknumber.clone()];
+                //         binfo.extend(log_vec);
+                //         dwlr.write_record(&binfo).unwrap();
+                //     }
+                //     dwlr.flush().unwrap();
+                // }
+
                 // We've sealed the L2 block that we had, but we still need to set up the timestamp
                 // for the fictive L2 block.
                 let new_l2_block_params =
@@ -485,6 +645,7 @@ impl ZkSyncStateKeeper {
                 let exec_result_status = tx_result.result.clone();
                 let initiator_account = tx.initiator_account();
 
+
                 updates_manager.extend_from_executed_transaction(
                     tx,
                     *tx_result,
@@ -493,6 +654,8 @@ impl ZkSyncStateKeeper {
                     tx_execution_metrics,
                     call_tracer_result,
                 );
+
+
 
                 tracing::debug!(
                     "Finished re-executing tx {tx_hash} by {initiator_account} (is_l1: {is_l1}, \
@@ -506,6 +669,7 @@ impl ZkSyncStateKeeper {
                     block_execution_metrics = updates_manager.pending_execution_metrics()
                 );
             }
+
         }
 
         tracing::debug!(
@@ -558,6 +722,158 @@ impl ZkSyncStateKeeper {
                     updates_manager.l1_batch.number
                 );
                 self.seal_l2_block(updates_manager).await?;
+
+                let mut digest = L2BlockHasher::new(
+                    updates_manager.l2_block.number.clone(),
+                    updates_manager.l2_block.timestamp.clone(),
+                    updates_manager.l2_block.prev_block_hash,
+                );
+                let tsstring = updates_manager.l2_block.timestamp.clone().to_string();
+                let blknumber = updates_manager.l2_block.number.clone().to_string();
+
+                let utc_time = Utc.timestamp_opt(updates_manager.l2_block.timestamp as i64 , 0).unwrap();
+                let utc_time_string = utc_time.format("%Y-%m-%d").to_string();
+                let utc_time_hh = utc_time.format("%H").to_string();
+                let utc_time_h = utc_time_hh.strip_prefix("0").unwrap_or(&utc_time_hh);
+                let daypath = Path::new(&utc_time_string);
+                let sub_path = daypath.join(&utc_time_h);
+                let d_path = Path::new("/data01/full_node").join("dump/").join(&sub_path);
+                let e_path = Path::new("/data01/full_node").join("errors/").join(&sub_path);
+                let l_path = Path::new("/data01/full_node").join("events/").join(&sub_path);
+                let mut trace_data = Vec::new();
+                let mut error_data = Vec::new();
+                //let mut events_data = Vec::new();
+
+                for (txpos, tx) in updates_manager.l2_block.executed_transactions.clone().into_iter().enumerate() {
+                    let txhash = tx.hash.clone();
+                    match tx.revert_reason.clone() {
+                        Some(output) => {
+                            let err_vec = vec![format!("{:#x}", txhash.clone()), output.clone().to_string()];
+                            error_data.push(err_vec);
+                        }
+                        None => ()
+                    }
+                    digest.push_tx_hash(txhash.clone());
+                    let calltracer_result = tx.call_trace();
+                    match calltracer_result {
+                        Some(call_trace) => {
+                            let result: DebugCall = call_trace.into();
+
+                            let mut call_trace_flat = Vec::new();
+
+                            let mut trace_address = vec![]; // Initialize the trace addressees with the index of the top-level call
+                            flatten_call_recursive(
+                                &result,
+                                &mut call_trace_flat,
+                                &mut trace_address,
+                            );
+                            let mut calltype = String::new();
+                            for (i, trace) in call_trace_flat.iter().enumerate() {
+                                if trace.action.r#type == DebugCallType::Call {
+                                    calltype = "call".to_string();
+                                } else {
+                                    calltype = "create".to_string();
+                                }
+                                let mut errorstring = "".to_string();
+                                let traceerror = trace.error.clone();
+                                match traceerror {
+                                    Some(value) => { errorstring = value }
+                                    None => ()
+                                }
+                                let subtraces = trace.subtraces.to_string();
+                                let traceaddr = format!("{:?}", trace.traceaddress);
+                                let txhashstring = format!("{:#x}", txhash);
+                                let txposstring = txpos.to_string();
+                                let typestring = calltype.clone();
+                                let mut action_from = format!("{:#x}", trace.action.from);
+                                let mut action_to = format!("{:#x}", trace.action.to);
+                                if i == 0 {
+                                    action_from = format!("{:#x}", tx.transaction.initiator_account());
+                                    action_to = format!("{:#x}", tx.transaction.execute.contract_address);
+                                }
+                                let action_gas = trace.action.gas.to_string();
+                                let action_value = trace.action.value.to_string();
+                                let action_calltype = calltype.clone();
+                                let action_input = serde_json::to_string(&trace.action.input).unwrap().trim_matches('\"').to_string();
+                                let result_output = serde_json::to_string(&trace.result.output).unwrap().trim_matches('\"').to_string();
+                                let result_gasused = trace.result.gas_used.to_string();
+
+                                let tracepos = i.to_string();
+                                let tresult = vec![subtraces, traceaddr, txhashstring, txposstring, typestring, action_from, action_to, action_gas, action_value, action_calltype, action_input, result_output, result_gasused, errorstring, tracepos];
+                                trace_data.push(tresult);
+                            }
+                        },
+                        None => ()
+                    }
+                    // let events: Vec<_> = updates_manager.miniblock.events.iter().filter(|log| log.location.1 == txpos as u32 ).collect();
+                    // for (logpos, txlog) in events.into_iter().enumerate() {
+
+                    //     let txhashstring = format!("{:#x}", txhash);
+                    //     let txposstring = txpos.to_string();
+                    //     let from = format!("{:#x}", tx.transaction.initiator_account());
+                    //     let to = format!("{:#x}", tx.transaction.execute.contract_address);
+                    //     let address = format!("{:#x}", txlog.address);
+                    //     let logindex = logpos.to_string();
+                    //     let data = "0x".to_string() + &hex::encode(txlog.value.clone());
+                    //     let n_topic = txlog.indexed_topics.len().to_string();
+                    //     let mut topic_0 = "".to_string();
+                    //     let mut topics = "[]".to_string();
+                    //     let topic0 = txlog.indexed_topics.get(0);
+                    //     match topic0 {
+                    //         Some(topic0) => {
+                    //             topic_0 = format!("{:#x}", topic0);
+                    //             topics = "[".to_string() + &txlog.indexed_topics.iter().map(|topic| format!("{:#x}", topic)).collect::<Vec<_>>().join(",") + &"]".to_string()
+                    //         }
+                    //         None => ()
+                    //     }
+                    //     let tracepos = "".to_string();
+                    //     let tracedepth = "".to_string();
+                    //     let lresult = vec![txhashstring, txposstring, from, to, logindex, address, data, n_topic, topic_0, topics, tracepos, tracedepth];
+                    //     events_data.push(lresult);
+                    // }
+                }
+                let blkhash = serde_json::to_string(&digest.finalize(updates_manager.protocol_version())).unwrap().trim_matches('\"').to_string();
+                let filename = blknumber.clone() + "_" + &blkhash[2..8]+ ".csv";
+
+                if !trace_data.is_empty() {
+                    // create dir and new writer for traces
+                    std::fs::create_dir_all(&d_path).unwrap();
+                    let dump_path = d_path.join(&filename);
+                    let file = OpenOptions::new().write(true).create(true).open(dump_path).unwrap();
+                    let mut dwtr = WriterBuilder::new().quote_style(QuoteStyle::Never).double_quote(false).delimiter(b'^').from_writer(&file);
+                    for trace_vec in trace_data {
+                        let mut binfo = vec![tsstring.clone(), utc_time_string.clone(), blkhash.clone(), blknumber.clone()];
+                        binfo.extend(trace_vec);
+                        dwtr.write_record(&binfo).unwrap();
+                    }
+                    dwtr.flush().unwrap();
+                }
+
+                if !error_data.is_empty() {
+                    // create dir and new writer for traces
+                    std::fs::create_dir_all(&e_path).unwrap();
+                    let err_path = e_path.join(&filename);
+                    let file = OpenOptions::new().write(true).create(true).open(err_path).unwrap();
+                    let mut ewtr = WriterBuilder::new().quote_style(QuoteStyle::Never).double_quote(false).delimiter(b'^').from_writer(&file);
+                    for err_vec in error_data {
+                        ewtr.write_record(&err_vec).unwrap();
+                    }
+                    ewtr.flush().unwrap();
+                }
+
+                // if !events_data.is_empty() {
+                //     // create dir and new writer for traces
+                //     std::fs::create_dir_all(&l_path).unwrap();
+                //     let log_path = l_path.join(&filename);
+                //     let file = OpenOptions::new().write(true).create(true).open(log_path).unwrap();
+                //     let mut dwlr = WriterBuilder::new().quote_style(QuoteStyle::Never).double_quote(false).delimiter(b'^').from_writer(&file);
+                //     for log_vec in events_data {
+                //         let mut binfo = vec![tsstring.clone(), utc_time_string.clone(), blkhash.clone(), blknumber.clone()];
+                //         binfo.extend(log_vec);
+                //         dwlr.write_record(&binfo).unwrap();
+                //     }
+                //     dwlr.flush().unwrap();
+                // }
 
                 let new_l2_block_params = self
                     .wait_for_new_l2_block_params(updates_manager)

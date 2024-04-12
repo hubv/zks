@@ -48,7 +48,7 @@ pub fn flatten_debug_calls(calls: Vec<ResultDebugCall>) -> Vec<DebugCallFlat> {
     flattened_calls
 }
 
-fn flatten_call_recursive(
+pub fn flatten_call_recursive(
     call: &DebugCall,
     flattened_calls: &mut Vec<DebugCallFlat>,
     trace_address: &mut Vec<usize>,
