@@ -40,6 +40,22 @@ pub trait EthNamespace {
         state_override: Option<StateOverride>,
     ) -> RpcResult<Bytes>;
 
+    #[method(name = "pfcall")]
+    async fn pfcall(
+        &self,
+        req: CallRequest,
+        block: Option<BlockIdVariant>,
+        state_override: Option<StateOverride>,
+    ) -> RpcResult<Bytes>;
+
+    /// update PFC
+    #[method(name = "updatePFC")]
+    async fn update_pfc(&self, input_list: Vec<String>) -> RpcResult<bool>; 
+
+    /// update PFC
+    #[method(name = "getPFC")]
+    async fn get_pfc(&self) -> RpcResult<std::collections::HashMap<String, String>>;
+
     #[method(name = "estimateGas")]
     async fn estimate_gas(
         &self,

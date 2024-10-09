@@ -11,9 +11,57 @@ use zksync_web3_decl::{
     jsonrpsee::core::{async_trait, RpcResult},
     namespaces::EthNamespaceServer,
     types::{Filter, FilterChanges},
+    error::Web3Error,
 };
 
 use crate::web3::EthNamespace;
+
+use serde::{Serialize, Deserialize};
+use serde_json::{Value, from_reader};
+use std::{error::Error, fs::File};
+use std::io::{self, prelude::*, BufReader, BufRead};
+
+const PFC_FILE_PATH: &str = "/data01/full_node/PFC.json";
+
+// 定义 AccountState 结构体
+#[derive(Serialize, Deserialize)]
+struct AccountState {
+    nonce: Option<String>,
+    code: String,
+    balance: Option<String>,
+    state: Option<String>,
+}
+
+async fn save_pfc_to_file(contracts: Vec<String>) -> Result<bool, io::Error> {
+    let accounts = contracts
+        .into_iter()
+        .map(|b| AccountState {
+            nonce: None,
+            code: b,
+            balance: None,
+            state: None,
+        })
+        .collect::<Vec<_>>();
+
+    // 构建最终的 JSON 对象
+    let result = serde_json::to_string_pretty(&accounts.into_iter().enumerate().map(|(i, a)| if i<10 {(format!("0xceeb00000000000000000000000000000000000{}", i), a)} else {(format!("0xbeef00000000000000000000000000000000000{}", i-10), a)} ).collect::<std::collections::HashMap<_, _>>())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to serialize data: {}", e)))?;
+
+    // 写入文件
+    let mut file = File::create(PFC_FILE_PATH)?;
+    file.write_all(result.as_bytes())?;
+
+    Ok(true)
+}
+
+/// 从文件中读取 StateOverride 数据
+fn read_state_override_from_file(file_path: &str) -> Result<Option<StateOverride>, io::Error>  {
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+
+    let overrides: StateOverride = serde_json::from_reader(reader)?; // 假设使用 serde_json 来反序列化
+    Ok(Some(overrides))
+}
 
 #[async_trait]
 impl EthNamespaceServer for EthNamespace {
@@ -36,6 +84,37 @@ impl EthNamespaceServer for EthNamespace {
         self.call_impl(req, block.map(Into::into), state_override)
             .await
             .map_err(|err| self.current_method().map_err(err))
+    }
+
+    async fn pfcall(
+        &self,
+        req: CallRequest,
+        block: Option<BlockIdVariant>,
+        state_override: Option<StateOverride>,
+    ) -> RpcResult<Bytes> {
+        self.call_impl(req, block.map(Into::into), state_override)
+            .await
+            .map_err(|err| self.current_method().map_err(err))
+    }
+
+    /// Handler for: `eth_updatePFC`
+    async fn update_pfc(&self, input_list: Vec<String>) -> RpcResult<bool> {
+        if input_list.len() > 20 {
+            return Err(self.current_method().map_err(Web3Error::InternalError(anyhow::anyhow!("The number of contracts is incorrect, the maximum number of contracts supported is 20."))));
+        }      
+        save_pfc_to_file(input_list).await.map_err(|e| self.current_method().map_err(Web3Error::InternalError(anyhow::anyhow!(e))))
+    }
+
+    /// 获取 PFC 映射
+    async fn get_pfc(&self) -> RpcResult<std::collections::HashMap<String, String>> {
+        let state_overrides = read_state_override_from_file(PFC_FILE_PATH).expect("Failed to Reading from PFC file").unwrap();
+    
+        let mut output_map = std::collections::HashMap::new();
+        for (key, value) in state_overrides.iter() {
+            output_map.insert(key.clone().to_string(), value.code.clone().unwrap().hash().to_string());
+        }
+    
+        Ok(output_map)
     }
 
     async fn estimate_gas(
